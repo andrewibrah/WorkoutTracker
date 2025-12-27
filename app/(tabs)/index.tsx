@@ -1,6 +1,7 @@
 import { Image } from "expo-image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   AppState,
   Button,
   KeyboardAvoidingView,
@@ -9,24 +10,28 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Text,
   TextInput,
   View,
 } from "react-native";
 
 import { ThemedText } from "@/components/themed-text";
 import { ThemedView } from "@/components/themed-view";
+import { api, type ApiWorkoutRow } from "@/lib/api";
+import { saveWorkout, type WorkoutRow as StoredWorkoutRow } from "@/lib/workoutStorage";
+import { useRouter } from "expo-router";
 
 type BodyPart =
-  | "Chest"
-  | "Back"
-  | "Legs"
-  | "Shoulders"
-  | "Arms"
   | "Push"
   | "Pull"
-  | "Full Body"
-  | "Cardio"
-  | "Other";
+  | "Legs"
+  | "Abs"
+  | "Chest"
+  | "Back"
+  | "Bis"
+  | "Tris"
+  | "Shoulders"
+  | "Cardio";
 
 type LogRow = {
   id: string;
@@ -44,7 +49,16 @@ function getTodayMMDD(): string {
   return `${mm}/${dd}`;
 }
 
+function todayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function makeId() {
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
 export default function HomeScreen() {
+  const router = useRouter();
   // Session header state
   const [sessionDate, setSessionDate] = useState<string>(getTodayMMDD());
   const [bodyParts, setBodyParts] = useState<BodyPart[]>([]);
@@ -52,26 +66,31 @@ export default function HomeScreen() {
   // Table rows (in-memory only for now)
   const [rows, setRows] = useState<LogRow[]>([]);
 
-  // “Chat input filler” fields
-  const [exerciseInput, setExerciseInput] = useState<string>("");
-  const [weightInput, setWeightInput] = useState<string>("");
-  const [repsInput, setRepsInput] = useState<string>("");
-  const [notesInput, setNotesInput] = useState<string>("");
+  // Workout session lifecycle
+  const [workoutActive, setWorkoutActive] = useState(false);
+  const [workoutId, setWorkoutId] = useState<string | null>(null);
+  const [workoutCreatedAt, setWorkoutCreatedAt] = useState<number | null>(null);
+  const [workoutDateISO, setWorkoutDateISO] = useState<string | null>(null);
 
-  // Body part picker
+  // Message input
+  const [messageInput, setMessageInput] = useState<string>("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Body part picker (single select on start)
   const [pickerOpen, setPickerOpen] = useState(false);
   const BODY_PARTS: BodyPart[] = useMemo(
     () => [
-      "Chest",
-      "Back",
-      "Legs",
-      "Shoulders",
-      "Arms",
       "Push",
       "Pull",
-      "Full Body",
+      "Legs",
+      "Abs",
+      "Chest",
+      "Back",
+      "Bis",
+      "Tris",
+      "Shoulders",
       "Cardio",
-      "Other",
     ],
     []
   );
@@ -83,6 +102,11 @@ export default function HomeScreen() {
     return `${sessionDate} ${bp}Workout`;
   }, [sessionDate, bodyParts]);
 
+  const selectedPart = useMemo(
+    () => (bodyParts.length ? bodyParts.join(" + ") : ""),
+    [bodyParts]
+  );
+
   const resetForNewDay = (nextDate: string) => {
     // Automated daily rollover:
     // - Update date
@@ -92,10 +116,13 @@ export default function HomeScreen() {
     setSessionDate(nextDate);
     setBodyParts([]);
     setRows([]);
-    setExerciseInput("");
-    setWeightInput("");
-    setRepsInput("");
-    setNotesInput("");
+    setMessageInput("");
+    setLoading(false);
+    setError(null);
+    setWorkoutActive(false);
+    setWorkoutId(null);
+    setWorkoutCreatedAt(null);
+    setWorkoutDateISO(null);
   };
 
   const ensureFreshSession = () => {
@@ -122,37 +149,99 @@ export default function HomeScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionDate]);
 
-  const nextSetNumberForExercise = (exerciseName: string): number => {
-    const normalized = exerciseName.trim().toLowerCase();
-    if (!normalized) return 1;
-    const count = rows.reduce((acc, r) => {
-      return r.exercise.trim().toLowerCase() === normalized ? acc + 1 : acc;
-    }, 0);
-    return count + 1;
+  const buildRowsFromApi = (apiRows: ApiWorkoutRow[]): LogRow[] => {
+    return apiRows
+      .filter((row) => row.exercise && row.exercise.trim())
+      .map((row) => ({
+        id: `${Date.now()}-${Math.random()}`,
+        exercise: row.exercise.trim(),
+        set: Number.isFinite(row.set) ? row.set : 1,
+        weightLbs: String(row.weightLbs ?? "").trim(),
+        reps: String(row.reps ?? "").trim(),
+        notes: String(row.notes ?? "").trim(),
+      }));
   };
 
-  const addRow = () => {
-    const ex = exerciseInput.trim();
-    if (!ex) return;
+  const onStartWorkout = () => {
+    if (workoutActive) {
+      Alert.alert("Workout already started", "End the current workout to start a new one.");
+      return;
+    }
+    setPickerOpen(true);
+  };
 
-    const newRow: LogRow = {
-      id: `${Date.now()}-${Math.random()}`,
-      exercise: ex,
-      set: nextSetNumberForExercise(ex),
-      weightLbs: weightInput.trim(),
-      reps: repsInput.trim(),
-      notes: notesInput.trim(),
-    };
+  const onEndWorkout = async () => {
+    if (!workoutActive) {
+      Alert.alert("No active workout", "Start a workout first.");
+      return;
+    }
+    if (!rows.length) {
+      Alert.alert("Nothing to save", "Log at least one set first.");
+      return;
+    }
 
-    setRows((prev) => [...prev, newRow]);
+    const storedRows: StoredWorkoutRow[] = rows.map((row) => ({
+      exercise: row.exercise,
+      weightLbs: row.weightLbs,
+      reps: row.reps,
+      notes: row.notes,
+    }));
 
-    // Keep exercise for fast repeated sets; clear the rest.
-    setWeightInput("");
-    setRepsInput("");
-    setNotesInput("");
+    await saveWorkout({
+      id: workoutId ?? makeId(),
+      dateISO: workoutDateISO ?? todayISO(),
+      part: selectedPart.trim() || "Workout",
+      rows: storedRows,
+      createdAt: workoutCreatedAt ?? Date.now(),
+    });
 
-    // Scroll to bottom so the new row is visible.
-    requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
+    Alert.alert("Saved", "Workout added to History.");
+    setWorkoutActive(false);
+    setWorkoutId(null);
+    setWorkoutCreatedAt(null);
+    setWorkoutDateISO(null);
+    setRows([]);
+    setMessageInput("");
+  };
+
+  const sendMessage = async () => {
+    const message = messageInput.trim();
+    if (!message || loading) return;
+    if (!workoutActive) {
+      Alert.alert("Start workout", "Start a workout before logging sets.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const contextRows: ApiWorkoutRow[] = rows.map((row) => ({
+        exercise: row.exercise,
+        set: row.set,
+        weightLbs: row.weightLbs,
+        reps: row.reps,
+        notes: row.notes,
+      }));
+      const res = await api.chat(message, contextRows);
+      let newRows: LogRow[] = [];
+      setRows((prev) => {
+        newRows = buildRowsFromApi(res.rows);
+        return newRows.length ? [...prev, ...newRows] : prev;
+      });
+
+      if (newRows.length === 0) {
+        setError("No rows returned");
+        return;
+      }
+
+      setMessageInput("");
+      requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
+    } catch (e) {
+      setError("Failed to reach API");
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -170,17 +259,6 @@ export default function HomeScreen() {
           <ThemedText type="title" style={styles.titleText}>
             {title}
           </ThemedText>
-
-          <Pressable
-            onPress={() => setPickerOpen(true)}
-            style={styles.bodyPartPill}
-            accessibilityRole="button"
-            accessibilityLabel="Select body part"
-          >
-            <ThemedText style={styles.bodyPartPillText}>
-              {bodyParts.length ? bodyParts.join(" + ") : "Tap to set body parts"}
-            </ThemedText>
-          </Pressable>
         </View>
       </ThemedView>
 
@@ -233,49 +311,52 @@ export default function HomeScreen() {
         </ScrollView>
       </ThemedView>
 
-      {/* Input row (chat-like filler) */}
+      {/* Message input */}
       <View style={styles.inputWrap}>
         <View style={styles.inputGrid}>
           <TextInput
-            value={exerciseInput}
-            onChangeText={setExerciseInput}
-            placeholder="Exercise"
-            style={[styles.input, styles.exerciseInput]}
-            returnKeyType="next"
-          />
-          <TextInput
-            value={weightInput}
-            onChangeText={setWeightInput}
-            placeholder="Weight"
-            style={[styles.input, styles.smallInput]}
-            keyboardType={Platform.select({ ios: "numbers-and-punctuation", android: "numeric" })}
-            returnKeyType="next"
-          />
-          <TextInput
-            value={repsInput}
-            onChangeText={setRepsInput}
-            placeholder="Reps"
-            style={[styles.input, styles.smallInput]}
-            keyboardType={Platform.select({ ios: "numbers-and-punctuation", android: "numeric" })}
-            returnKeyType="next"
-          />
-          <TextInput
-            value={notesInput}
-            onChangeText={setNotesInput}
-            placeholder="Notes"
-            style={[styles.input, styles.notesInput]}
-            returnKeyType="done"
-            onSubmitEditing={addRow}
+            value={messageInput}
+            onChangeText={setMessageInput}
+            placeholder="e.g. Leg press 4 plates 10 reps"
+            style={[styles.input, styles.messageInput]}
+            returnKeyType="send"
+            onSubmitEditing={sendMessage}
           />
         </View>
 
         <View style={styles.actionsRow}>
-          <Button title="Add" onPress={addRow} />
+          <Button
+            title={loading ? "Sending..." : "Send"}
+            onPress={sendMessage}
+            disabled={loading || !messageInput.trim()}
+          />
           <Button title="Clear" onPress={() => setRows([])} />
         </View>
 
+        <View style={styles.sessionRow}>
+          <Pressable onPress={() => router.push("/history")} style={styles.sessionButton}>
+            <Text style={styles.sessionButtonText}>History</Text>
+          </Pressable>
+          <Pressable
+            onPress={onStartWorkout}
+            style={[styles.sessionButton, workoutActive && styles.sessionButtonDisabled]}
+            disabled={workoutActive}
+          >
+            <Text style={styles.sessionButtonText}>Start workout</Text>
+          </Pressable>
+          <Pressable
+            onPress={onEndWorkout}
+            style={[styles.sessionButton, !workoutActive && styles.sessionButtonDisabled]}
+            disabled={!workoutActive}
+          >
+            <Text style={styles.sessionButtonText}>End workout</Text>
+          </Pressable>
+        </View>
+
+        {error ? <ThemedText style={styles.errorText}>{error}</ThemedText> : null}
+
         <ThemedText style={styles.hint}>
-          {`Tip: keep Exercise filled, then just punch Weight/Reps for fast set logging.`}
+          {`Tip: include exercise, weight, reps, and notes in one message.`}
         </ThemedText>
       </View>
 
@@ -289,44 +370,33 @@ export default function HomeScreen() {
         <Pressable style={styles.modalBackdrop} onPress={() => setPickerOpen(false)}>
           <Pressable style={styles.modalCard} onPress={() => {}}>
             <ThemedText type="title" style={styles.modalTitle}>
-              Select Body Part
+              What body part are you training
             </ThemedText>
 
             <ScrollView contentContainerStyle={styles.modalList}>
               {BODY_PARTS.map((bp) => {
-                const selected = bodyParts.includes(bp);
                 return (
                   <Pressable
                     key={bp}
                     onPress={() => {
-                      setBodyParts((prev) =>
-                        prev.includes(bp) ? prev.filter((x) => x !== bp) : [...prev, bp]
-                      );
+                      setBodyParts([bp]);
+                      setWorkoutActive(true);
+                      setWorkoutId(makeId());
+                      setWorkoutCreatedAt(Date.now());
+                      setWorkoutDateISO(todayISO());
+                      setRows([]);
+                      setMessageInput("");
+                      setError(null);
+                      setPickerOpen(false);
                     }}
-                    style={[styles.modalItem, selected && styles.modalItemSelected]}
+                    style={styles.modalItem}
                   >
                     <View style={styles.modalItemRow}>
                       <ThemedText style={styles.modalItemText}>{bp}</ThemedText>
-                      <ThemedText style={styles.modalItemCheck}>{selected ? "✓" : ""}</ThemedText>
                     </View>
                   </Pressable>
                 );
               })}
-
-              <Pressable
-                onPress={() => {
-                  setBodyParts([]);
-                }}
-                style={[styles.modalItem, styles.modalClear]}
-              >
-                <ThemedText style={styles.modalItemText}>Clear selection</ThemedText>
-              </Pressable>
-              <Pressable
-                onPress={() => setPickerOpen(false)}
-                style={[styles.modalItem, styles.modalDone]}
-              >
-                <ThemedText style={styles.modalItemText}>Done</ThemedText>
-              </Pressable>
             </ScrollView>
           </Pressable>
         </Pressable>
@@ -356,18 +426,6 @@ const styles = StyleSheet.create({
   titleText: {
     textAlign: "center",
   },
-  bodyPartPill: {
-    alignSelf: "center",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: "#D0D0D0",
-  },
-  bodyPartPillText: {
-    fontSize: 14,
-  },
-
   tableWrap: {
     flex: 1,
     borderWidth: 1,
@@ -449,20 +507,36 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
     fontSize: 14,
   },
-  exerciseInput: {
-    flex: 2.2,
-  },
-  smallInput: {
+  messageInput: {
     flex: 1,
-    textAlign: "center",
-  },
-  notesInput: {
-    flex: 1.6,
   },
   actionsRow: {
     flexDirection: "row",
     gap: 10,
     justifyContent: "flex-end",
+  },
+  sessionRow: {
+    flexDirection: "row",
+    gap: 10,
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  sessionButton: {
+    borderWidth: 1,
+    borderColor: "#D0D0D0",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: "#FFFFFF",
+  },
+  sessionButtonDisabled: {
+    opacity: 0.5,
+  },
+  sessionButtonText: {
+    fontSize: 14,
+  },
+  errorText: {
+    color: "#B00020",
   },
   hint: {
     opacity: 0.7,
@@ -495,25 +569,10 @@ const styles = StyleSheet.create({
     borderColor: "#E6E6E6",
     borderRadius: 12,
   },
-  modalItemSelected: {
-    borderColor: "#BDBDBD",
-    backgroundColor: "#F7F7F7",
-  },
   modalItemRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-  },
-  modalItemCheck: {
-    fontSize: 18,
-    opacity: 0.9,
-  },
-  modalDone: {
-    borderColor: "#CFCFCF",
-    backgroundColor: "#F2F2F2",
-  },
-  modalClear: {
-    borderColor: "#D8D8D8",
   },
   modalItemText: {
     fontSize: 16,
